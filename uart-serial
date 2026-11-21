@@ -1,0 +1,194 @@
+const int TX_PIN = 4; // Port D, Bit 4 (PD4)
+const int RX_PIN = 2; // Port D, Bit 2 (PD2 / Hardware Interrupt INT0)
+const unsigned int BIT_DELAY = 1000; // 1000 us per bit (~1000 baud)
+
+// Ring buffer for incoming 7-bit bytes so multi-character messages aren't missed
+const int RX_BUFFER_SIZE = 64;
+volatile byte rxBuffer[RX_BUFFER_SIZE];
+volatile int rxHead = 0;
+volatile int rxTail = 0;
+volatile unsigned long lastByteTime = 0;
+
+void setup() {
+  pinMode(TX_PIN, OUTPUT);
+  pinMode(RX_PIN, INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  // Set TX_PIN (PD4) HIGH for idle state
+  PORTD |= (1 << PD4); 
+  
+  Serial.begin(9600);
+  attachInterrupt(digitalPinToInterrupt(RX_PIN), onStartBit, FALLING);
+
+  Serial.println("Arduino Uno 7-Bit Transceiver Ready.");
+  Serial.println("Enter a number (0-127) OR text/letters:");
+}
+
+void loop() {
+  // 1. Check if incoming bytes are waiting and if the message has finished
+  processIncomingMessage();
+
+  // 2. Check if user entered text or numbers in Serial Monitor
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    if (input.length() == 0) return;
+
+    if (isPureNumber(input)) {
+      long val = input.toInt();
+      if (val >= 0 && val <= 127) {
+        Serial.print("Sent Number -> ");
+        Serial.print(val);
+        Serial.print(" (0b");
+        print7Bits((byte)val);
+        Serial.println(")");
+
+        digitalWrite(LED_BUILTIN, HIGH);
+        send7Bit((byte)val);
+        delay(2);
+        send7Bit('\n'); // Send 7-bit End-of-Message marker (0x0A)
+        digitalWrite(LED_BUILTIN, LOW);
+      } else {
+        Serial.println("Error: Numbers must be between 0 and 127.");
+      }
+    } else {
+      Serial.print("Sent Text   -> \"");
+      Serial.print(input);
+      Serial.println("\"");
+
+      digitalWrite(LED_BUILTIN, HIGH);
+      for (unsigned int i = 0; i < input.length(); i++) {
+        byte asciiVal = input[i] & 0x7F;
+        send7Bit(asciiVal);
+        delay(2); // Brief gap between characters
+      }
+      send7Bit('\n'); // Send 7-bit End-of-Message marker (0x0A)
+      digitalWrite(LED_BUILTIN, LOW);
+    }
+  }
+}
+
+void processIncomingMessage() {
+  static byte msgBytes[RX_BUFFER_SIZE];
+  static int msgLen = 0;
+  bool messageComplete = false;
+
+  // Pull any newly arrived bytes out of the interrupt buffer
+  while (rxHead != rxTail) {
+    noInterrupts();
+    byte b = rxBuffer[rxTail];
+    rxTail = (rxTail + 1) % RX_BUFFER_SIZE;
+    interrupts();
+
+    if (b == '\n') { // End-of-message marker received
+      messageComplete = true;
+      break;
+    } else if (msgLen < RX_BUFFER_SIZE - 1) {
+      msgBytes[msgLen++] = b;
+    }
+  }
+
+  // Fallback timeout: if bytes arrived without '\n' and line has been idle for 20ms
+  if (!messageComplete && msgLen > 0) {
+    noInterrupts();
+    unsigned long elapsed = millis() - lastByteTime;
+    interrupts();
+    if (elapsed > 20) {
+      messageComplete = true;
+    }
+  }
+
+  // Print the complete message all at once
+  if (messageComplete && msgLen > 0) {
+    Serial.print("Received -> ");
+
+    if (msgLen == 1) {
+      // Single byte: show Decimal, Char (if printable), and 7-bit Binary
+      byte b = msgBytes[0];
+      Serial.print("Dec: ");
+      Serial.print(b);
+      if (b >= 32 && b <= 126) {
+        Serial.print(" | Char: '");
+        Serial.print((char)b);
+        Serial.print("'");
+      }
+      Serial.print(" | Bin: 0b");
+      print7Bits(b);
+      Serial.println();
+    } else {
+      // Multi-character message: print assembled string
+      Serial.print("Text: \"");
+      for (int i = 0; i < msgLen; i++) {
+        Serial.print((char)msgBytes[i]);
+      }
+      Serial.println("\"");
+    }
+
+    msgLen = 0; // Reset for next message
+  }
+}
+
+bool isPureNumber(String str) {
+  for (unsigned int i = 0; i < str.length(); i++) {
+    if (!isDigit(str[i])) return false;
+  }
+  return true;
+}
+
+// ISR triggered on Pin 2 falling edge
+void onStartBit() {
+  noInterrupts();
+  byte data = 0;
+  
+  delayMicroseconds(BIT_DELAY + (BIT_DELAY / 2));
+
+  for (int i = 0; i < 7; i++) {
+    if (PIND & (1 << PD2)) {
+      data |= (1 << i);
+    }
+    delayMicroseconds(BIT_DELAY);
+  }
+
+  delayMicroseconds(BIT_DELAY / 2);
+
+  // Store byte into circular buffer
+  int nextHead = (rxHead + 1) % RX_BUFFER_SIZE;
+  if (nextHead != rxTail) {
+    rxBuffer[rxHead] = data;
+    rxHead = nextHead;
+  }
+  lastByteTime = millis();
+
+  EIFR = (1 << INTF0);
+  interrupts();
+}
+
+void send7Bit(byte data) {
+  noInterrupts();
+
+  PORTD &= ~(1 << PD4); // Start Bit (LOW)
+  delayMicroseconds(BIT_DELAY);
+
+  for (int i = 0; i < 7; i++) {
+    if ((data >> i) & 0x01) {
+      PORTD |= (1 << PD4);
+    } else {
+      PORTD &= ~(1 << PD4);
+    }
+    delayMicroseconds(BIT_DELAY);
+  }
+
+  PORTD |= (1 << PD4); // Stop Bit (HIGH)
+  delayMicroseconds(BIT_DELAY);
+
+  interrupts();
+}
+
+void print7Bits(byte val) {
+  for (int i = 6; i >= 0; i--) {
+    Serial.print((val >> i) & 0x01);
+  }
+}
+
+
