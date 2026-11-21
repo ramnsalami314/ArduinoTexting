@@ -1,3 +1,5 @@
+//test
+
 const int TX_PIN = 4; // Port D, Bit 4 (PD4)
 const int RX_PIN = 2; // Port D, Bit 2 (PD2 / Hardware Interrupt INT0)
 const unsigned int BIT_DELAY = 1000; // 1000 us per bit (~1000 baud)
