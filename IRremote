@@ -1,0 +1,316 @@
+
+
+#include <IRremote.hpp>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+const int IR_PIN = 2;   // IR receiver DAT -> Pin 2
+const int TX_PIN = 4;   // 7-bit serial TX output -> Pin 4
+const unsigned int BIT_DELAY = 1000; // ~1000 baud (1000 us per bit)
+const unsigned long TAP_TIMEOUT_MS = 1000;
+
+// I2C 16x2 LCD (0x27 or 0x3F)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Sequential 3x3 numpad mapping (1-9) plus 0 for space
+const char* KEYPAD_CHARS[10] = {
+  " ",     // 0 -> space
+  "ABC",   // 1
+  "DEF",   // 2
+  "GHI",   // 3
+  "JKL",   // 4
+  "MNO",   // 5
+  "PQR",   // 6
+  "STU",   // 7
+  "VWX",   // 8
+  "YZ"     // 9
+};
+
+// Common words and phrases cycled via Vol+ (0x02) and Vol- (0x98)
+const char* PHRASES[] = {
+  "HELLO",
+  "YES",
+  "NO",
+  "THANK YOU",
+  "PLEASE",
+  "HELP",
+  "OK",
+  "GOODBYE",
+  "WAIT",
+  "SORRY"
+};
+const int NUM_PHRASES = sizeof(PHRASES) / sizeof(PHRASES[0]);
+
+int activeDigit = -1;
+int tapIndex = 0;
+unsigned long lastTapTime = 0;
+
+int phraseIndex = -1; // -1 means no phrase currently selected
+String currentMessage = "";
+
+String fit16(const String& s) {
+  if (s.length() <= 16) return s;
+  return s.substring(s.length() - 16);
+}
+
+void updateLCD(const String& previewSuffix = "") {
+  lcd.clear();
+
+  // Top row: current message + active letter or phrase preview
+  lcd.setCursor(0, 0);
+  lcd.print(fit16(currentMessage + previewSuffix));
+
+  // Bottom row: committed text or hint
+  lcd.setCursor(0, 1);
+  if (currentMessage.length() == 0 && previewSuffix.length() == 0) {
+    lcd.print("1-9:ABC V+/-:PHR");
+  } else {
+    lcd.print(fit16(currentMessage));
+  }
+}
+
+void send7Bit(byte data) {
+  noInterrupts();
+
+  PORTD &= ~(1 << PD4); // Start bit (LOW)
+  delayMicroseconds(BIT_DELAY);
+
+  for (int i = 0; i < 7; i++) {
+    if ((data >> i) & 0x01) {
+      PORTD |= (1 << PD4);
+    } else {
+      PORTD &= ~(1 << PD4);
+    }
+    delayMicroseconds(BIT_DELAY);
+  }
+
+  PORTD |= (1 << PD4); // Stop bit (HIGH)
+  delayMicroseconds(BIT_DELAY);
+
+  interrupts();
+}
+
+void transmitString7Bit(const String& text) {
+  for (unsigned int i = 0; i < text.length(); i++) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    send7Bit((byte)text[i] & 0x7F);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(2);
+  }
+}
+
+void commitActiveChar() {
+  if (activeDigit < 0 || activeDigit > 9) return;
+
+  const char* letters = KEYPAD_CHARS[activeDigit];
+  size_t len = strlen(letters);
+  if (len > 0) {
+    char c = letters[tapIndex % len];
+    currentMessage += c;
+
+    Serial.print("Added '");
+    Serial.print(c);
+    Serial.print("' -> \"");
+    Serial.print(currentMessage);
+    Serial.println("\"");
+
+    updateLCD("");
+
+    digitalWrite(LED_BUILTIN, HIGH);
+    send7Bit((byte)c & 0x7F);
+    digitalWrite(LED_BUILTIN, LOW);
+  }
+
+  activeDigit = -1;
+  tapIndex = 0;
+}
+
+bool commitSelectedPhrase() {
+  if (phraseIndex < 0 || phraseIndex >= NUM_PHRASES) return false;
+
+  String selected = PHRASES[phraseIndex];
+  currentMessage += selected;
+
+  Serial.print("Inserted Phrase \"");
+  Serial.print(selected);
+  Serial.print("\" -> \"");
+  Serial.print(currentMessage);
+  Serial.println("\"");
+
+  updateLCD("");
+  transmitString7Bit(selected);
+
+  phraseIndex = -1;
+  return true;
+}
+
+void cyclePhrase(int delta) {
+  if (activeDigit != -1) {
+    commitActiveChar();
+  }
+
+  if (phraseIndex == -1) {
+    phraseIndex = (delta >= 0) ? 0 : (NUM_PHRASES - 1);
+  } else {
+    phraseIndex = (phraseIndex + delta + NUM_PHRASES) % NUM_PHRASES;
+  }
+
+  String preview = "[";
+  preview += PHRASES[phraseIndex];
+  preview += "]";
+
+  Serial.print("Phrase Preview: ");
+  Serial.println(preview);
+  updateLCD(preview);
+}
+
+void handlePlayKey() {
+  if (activeDigit != -1) {
+    commitActiveChar();
+    return;
+  }
+
+  if (commitSelectedPhrase()) {
+    return;
+  }
+
+  Serial.print("Sent Message -> \"");
+  Serial.print(currentMessage);
+  Serial.println("\"");
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Sent:");
+  lcd.setCursor(0, 1);
+  lcd.print(fit16(currentMessage));
+
+  digitalWrite(LED_BUILTIN, HIGH);
+  send7Bit('\n');
+  digitalWrite(LED_BUILTIN, LOW);
+
+  currentMessage = "";
+  delay(1200);
+  updateLCD("");
+}
+
+int mapDigit(uint8_t cmd) {
+  switch (cmd) {
+    case 0x68: return 0; // 0
+    case 0x30: return 1; // 1
+    case 0x18: return 2; // 2
+    case 0x7A: return 3; // 3
+    case 0x10: return 4; // 4
+    case 0x38: return 5; // 5
+    case 0x5A: return 6; // 6
+    case 0x42: return 7; // 7
+    case 0x4A: return 8; // 8
+    case 0x52: return 9; // 9
+    default:   return -1;
+  }
+}
+
+void onKeyPressed(uint8_t cmd) {
+  Serial.print("IR cmd: 0x");
+  Serial.println(cmd, HEX);
+
+  // Volume Up ('+' / Plus on Wokwi remote = 0x02) -> next phrase
+  if (cmd == 0x02) {
+    cyclePhrase(1);
+    return;
+  }
+
+  // Volume Down ('-' / Minus on Wokwi remote = 0x98) -> previous phrase
+  if (cmd == 0x98) {
+    cyclePhrase(-1);
+    return;
+  }
+
+  int digit = mapDigit(cmd);
+  if (digit >= 0) {
+    if (phraseIndex != -1) {
+      commitSelectedPhrase();
+    }
+
+    const char* letters = KEYPAD_CHARS[digit];
+    size_t len = strlen(letters);
+    if (len == 0) return;
+
+    unsigned long now = millis();
+    if (digit == activeDigit && (now - lastTapTime) < TAP_TIMEOUT_MS) {
+      tapIndex = (tapIndex + 1) % len;
+    } else {
+      if (activeDigit != -1) {
+        commitActiveChar();
+      }
+      activeDigit = digit;
+      tapIndex = 0;
+    }
+
+    lastTapTime = now;
+    String bracket = "[";
+    bracket += letters[tapIndex];
+    bracket += "]";
+
+    Serial.print("Typing: ");
+    Serial.print(currentMessage);
+    Serial.println(bracket);
+
+    updateLCD(bracket);
+    return;
+  }
+
+  // 'C' button -> cancel phrase/tap or delete last committed character
+  if (cmd == 0xB0) {
+    if (phraseIndex != -1) {
+      phraseIndex = -1;
+      Serial.println("Cancelled phrase selection.");
+      updateLCD("");
+    } else if (activeDigit != -1) {
+      activeDigit = -1;
+      tapIndex = 0;
+      Serial.println("Cancelled current letter.");
+      updateLCD("");
+    } else if (currentMessage.length() > 0) {
+      currentMessage.remove(currentMessage.length() - 1);
+      Serial.print("Deleted -> \"");
+      Serial.print(currentMessage);
+      Serial.println("\"");
+      updateLCD("");
+    }
+    return;
+  }
+
+  // 'Play' button -> commit letter/phrase, or finish and send '\n' on Pin 4
+  if (cmd == 0xA8) {
+    handlePlayKey();
+  }
+}
+
+void setup() {
+  pinMode(TX_PIN, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  PORTD |= (1 << PD4); // Idle HIGH on Pin 4
+
+  lcd.init();
+  lcd.backlight();
+  updateLCD("");
+
+  Serial.begin(9600);
+  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
+
+  Serial.println("=== IR Keypad + Phrase Selector Ready ===");
+  Serial.println("Vol+/Vol-: cycle phrases | Play: insert/send | C: cancel/del");
+}
+
+void loop() {
+  if (activeDigit != -1 && (millis() - lastTapTime) >= TAP_TIMEOUT_MS) {
+    commitActiveChar();
+  }
+
+  if (IrReceiver.decode()) {
+    if (!(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
+      onKeyPressed(IrReceiver.decodedIRData.command);
+    }
+    IrReceiver.resume();
+  }
+}
